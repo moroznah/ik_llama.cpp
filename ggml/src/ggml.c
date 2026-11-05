@@ -19172,12 +19172,30 @@ static void ggml_compute_forward_mul_mat_id(
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
-        const int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
+        int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
 
-        int total_chunks = 0;
+        int n_active = 0;
         for (int a = 0; a < n_as; a++) {
-            if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
+            if (matrix_row_counts[a] > 0) n_active++;
         }
+
+        if (ids->ne[0]*ids->ne[1] < 4*n_as && n_active > 0 && nth > 1) {
+            // token generation: use chunks of at least 128 rows, and make the number of chunks a
+            // multiple of the number of threads, so that the last round of chunks is not partly
+            // empty. Each chunk is a range of rows of dst, so this does not change the result.
+            chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 128)));
+            int g = nth, b = n_active;
+            while (b) { int t = g % b; g = b; b = t; }
+            const int unit = nth / g;
+            const int cap  = MAX(1, (int)(ne01 / 16));
+            if (unit <= cap) {
+                int cpe = ((chunks_per_expert + unit - 1) / unit) * unit;
+                if (cpe > cap) cpe = (cap / unit) * unit;
+                if (cpe >= 1) chunks_per_expert = cpe;
+            }
+        }
+
+        const int total_chunks = n_active * chunks_per_expert;
 
         int chunk_id = ith;
         while (chunk_id < total_chunks) {
