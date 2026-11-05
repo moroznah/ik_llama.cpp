@@ -381,8 +381,8 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         }
         const int kid_no    = gguf_find_key(gguf_ngram, llm_kv(LLM_KV_SPLIT_NO).c_str());
         const int kid_count = gguf_find_key(gguf_ngram, llm_kv(LLM_KV_SPLIT_COUNT).c_str());
-        if (n_split > 1 && kid_no >= 0 && kid_count >= 0 && gguf_get_val_u16(gguf_ngram, kid_count) == n_split) {
-            ngram_split_no = gguf_get_val_u16(gguf_ngram, kid_no);
+        if (n_split > 1 && kid_no >= 0 && kid_count >= 0 && GGUFMeta::GKV<uint16_t>::get_kv(gguf_ngram, kid_count) == n_split) {
+            ngram_split_no = GGUFMeta::GKV<uint16_t>::get_kv(gguf_ngram, kid_no);
         }
     }
 
