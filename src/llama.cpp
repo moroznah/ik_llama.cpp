@@ -5967,6 +5967,13 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*sizeof(int32_t));
 }
 
+// The mask and bias fills start their own threads on every call, and those threads inherit the
+// affinity of the calling thread: start one per 16M cells of work, up to the batch thread count.
+static int llama_set_inputs_n_threads(const llama_cparams & cparams, int64_t n_cells) {
+    const int64_t n = n_cells >> 24;
+    return (int) std::max<int64_t>(1, std::min<int64_t>(n, cparams.n_threads_batch));
+}
+
 static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
     // set input data
@@ -6263,9 +6270,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
         };
-        if (n_kv >= 1024 && n_tokens >= 32) {
-            // the same threshold the KQ_mask fill below uses for the same iteration space
-            const int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
+        const int n_thread = llama_set_inputs_n_threads(cparams, (int64_t) n_kv*n_tokens);
+        if (n_thread > 1) {
             const int32_t npt = (n_tokens + n_thread - 1)/n_thread;
             std::vector<std::thread> workers;
             for (int32_t i0 = npt; i0 < n_tokens; i0 += npt) {
@@ -6579,45 +6585,78 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
 
-            auto noalibi_f16 = [&mask_kv_self, &hparams, n_kv, n_swa_eff, data_f16, data_swa_f16] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
+            // the distinct sequences of the batch: a cell's membership is then looked up once per
+            // sequence instead of once per token
+            std::vector<llama_seq_id> mask_seqs;
+            std::vector<int> mask_seq_of(n_tokens);
+            for (int j = 0; j < n_tokens; ++j) {
+                const llama_seq_id seq_id = batch.seq_id[j][0];
+                int k = 0;
+                while (k < (int) mask_seqs.size() && mask_seqs[k] != seq_id) {
+                    ++k;
+                }
+                if (k == (int) mask_seqs.size()) {
+                    mask_seqs.push_back(seq_id);
+                }
+                mask_seq_of[j] = k;
+            }
+
+            // all rows of the cells [first, last)
+            auto noalibi_f16 = [&mask_kv_self, &hparams, &batch, &mask_seqs, &mask_seq_of, n_tokens, n_kv, n_swa_eff, data_f16, data_swa_f16] (int first, int last) {
                 ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
                 ggml_half h_zero = ggml_fp32_to_fp16(0.f);
-                for (int i = first; i < last; ++i) {
-                    ggml_half h = !mask_kv_self.cells[i].has_seq_id(seq_id) || mask_kv_self.cells[i].pos > pos ? h_inf : h_zero;
-                    if (data_f16) data_f16[j*n_kv + i] = h;
-                    if (data_swa_f16) {
-                        if (h != h_inf) {
-                            if (hparams.n_attn_chunk) {
-                                llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (mask_kv_self.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
-                                    h = h_inf;
+                const int n_block = 4096;
+                const int n_seqs  = (int) mask_seqs.size();
+                // the position of a cell of the sequence, or a position after every token's
+                std::vector<llama_pos> cell_pos((size_t) n_seqs*n_block);
+                for (int i0 = first; i0 < last; i0 += n_block) {
+                    const int i1 = std::min(last, i0 + n_block);
+                    for (int k = 0; k < n_seqs; ++k) {
+                        for (int i = i0; i < i1; ++i) {
+                            cell_pos[k*n_block + i - i0] = mask_kv_self.cells[i].has_seq_id(mask_seqs[k])
+                                ? mask_kv_self.cells[i].pos : std::numeric_limits<llama_pos>::max();
+                        }
+                    }
+                    for (int j = 0; j < n_tokens; ++j) {
+                        const llama_pos pos = batch.pos[j];
+                        const llama_pos * cpos = cell_pos.data() + mask_seq_of[j]*n_block;
+                        for (int i = i0; i < i1; ++i) {
+                            ggml_half h = cpos[i - i0] > pos ? h_inf : h_zero;
+                            if (data_f16) data_f16[j*n_kv + i] = h;
+                            if (data_swa_f16) {
+                                if (h != h_inf) {
+                                    if (hparams.n_attn_chunk) {
+                                        llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
+                                        if (mask_kv_self.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                            h = h_inf;
+                                        }
+                                    } else {
+                                        if (pos - mask_kv_self.cells[i].pos >= (int32_t)n_swa_eff) {
+                                            h = h_inf;
+                                        }
+                                    }
                                 }
-                            } else {
-                                if (pos - mask_kv_self.cells[i].pos >= (int32_t)n_swa_eff) {
-                                    h = h_inf;
-                                }
+                                data_swa_f16[j*n_kv + i] = h;
                             }
                         }
-                        data_swa_f16[j*n_kv + i] = h;
                     }
                 }
             };
 
-            if (n_kv >= 1024 && n_tokens >= 32) {
-                int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
+            const int n_thread = llama_set_inputs_n_threads(cparams, n_kv*n_tokens);
+            if (n_thread > 1) {
                 int npt = (n_kv + n_thread - 1)/n_thread;
                 auto compute = [&batch, &mask_kv_self, &hparams, &cparams, &noalibi_f16, n_tokens, n_kv, n_swa_eff, npt, data, data_swa, data_f16, data_swa_f16] (int ith) {
                     int first = ith * npt;
                     int last  = std::min(int(n_kv), first + npt);
                     if (last <= first) return;
+                    if (!hparams.use_alibi && cparams.flash_attn) {
+                        noalibi_f16(first, last);
+                        return;
+                    }
                     for (int j = 0; j < n_tokens; ++j) {
                         const llama_pos    pos    = batch.pos[j];
                         const llama_seq_id seq_id = batch.seq_id[j][0];
-
-                        if (!hparams.use_alibi && cparams.flash_attn) {
-                            noalibi_f16(j, pos, seq_id, first, last);
-                            continue;
-                        }
 
                         for (int i = first; i < last; ++i) {
                             float f;
@@ -6692,13 +6731,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
             for (int h = 0; h < 1; ++h) {
                 for (int j = 0; j < n_tokens; ++j) {
+                    if (!hparams.use_alibi && cparams.flash_attn) {
+                        noalibi_f16(0, n_kv);
+                        break;
+                    }
+
                     const llama_pos    pos    = batch.pos[j];
                     const llama_seq_id seq_id = batch.seq_id[j][0];
-
-                    if (!hparams.use_alibi && cparams.flash_attn) {
-                        noalibi_f16(j, pos, seq_id, 0, n_kv);
-                        continue;
-                    }
 
                     for (int i = 0; i < n_kv; ++i) {
                         float f;
