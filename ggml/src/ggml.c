@@ -13373,6 +13373,27 @@ static void ggml_compute_forward_dup_bytes(
     const int ir0 = dr * ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    if (src0->type == GGML_TYPE_F32 && ne02 == 1 && ne03 == 1 && ne0 == ne00 && ne1 == ne01 && ne2 == 1 && ne3 == 1 &&
+        nb01 == type_size && nb00 > type_size && nb00 % type_size == 0 && nb0 == type_size && nb1 == ne0*type_size) {
+        // 2-D transpose into a contiguous dst: copy 16x16 blocks, so that every cache line read
+        // from src0 is used for 16 values instead of one
+        const int64_t ld = nb00/type_size;
+        const float * x = (const float *) src0->data;
+        for (int64_t j0 = ir0; j0 < ir1; j0 += 16) {
+            const int64_t j1 = MIN(j0 + 16, (int64_t) ir1);
+            for (int64_t i0 = 0; i0 < ne00; i0 += 16) {
+                const int64_t i1 = MIN(i0 + 16, ne00);
+                for (int64_t j = j0; j < j1; ++j) {
+                    float * y = (float *) ((char *) dst->data + j*nb1);
+                    for (int64_t i = i0; i < i1; ++i) {
+                        y[i] = x[i*ld + j];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (src0->type == dst->type &&
         ggml_are_same_shape(src0, dst) &&
         nb00 == type_size && nb0 == type_size) {
@@ -13401,6 +13422,12 @@ static void ggml_compute_forward_dup_bytes(
             int nrows_per_thread = (nrows + nth - 1)/nth;
             int first = ith*nrows_per_thread;
             int last  = MIN(nrows, first + nrows_per_thread);
+            if (ne02 == 1 && ne03 == 1) {
+                for (int ir = first; ir < last; ++ir) {
+                    memcpy((char *)dst->data + ir*rs, (const char *) src0->data + ir*nb01, rs);
+                }
+                return;
+            }
             for (int ir = first; ir < last; ++ir) {
                 int ii = ir;
                 int i03 = ii/(ne01*ne02); ii -= i03*ne01*ne02;
@@ -22057,6 +22084,10 @@ static void ggml_compute_forward_rope_f32(
     const bool is_flipped = dst->op_params[15] == 1 && !is_vision && !is_mrope;
     const int  rope_offset = is_flipped ? ne0 - n_dims : 0;
 
+    // only the first n_dims entries of the cache are used, except for vision
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    const int64_t cache_ne = is_vision ? ne0 : MIN(MAX(n_dims, is_mrope ? sect_dims : 0), ne0);
+
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
         for (int64_t i2 = 0; i2 < ne2; i2++) { // seq-len
 
@@ -22068,7 +22099,7 @@ static void ggml_compute_forward_rope_f32(
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
-                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, cache_ne, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
             else {
                 const int64_t p_t = pos[i2];
@@ -22077,7 +22108,7 @@ static void ggml_compute_forward_rope_f32(
                 const int64_t p_e = pos[i2 + ne2 * 3];
                 ggml_mrope_cache_init(
                     p_t, p_h, p_w, p_e, sections, is_imrope, is_vision,
-                    freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                    freq_scale, freq_factors, corr_dims, cache_ne, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
 
             for (int64_t i1 = 0; i1 < ne1; i1++) { // attn-heads
@@ -22267,6 +22298,10 @@ static void ggml_compute_forward_rope_f16(
 
     const int32_t * pos = (const int32_t *) src1->data;
 
+    // only the first n_dims entries of the cache are used, except for vision
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    const int64_t cache_ne = is_vision ? ne0 : MIN(MAX(n_dims, is_mrope ? sect_dims : 0), ne0);
+
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
 
@@ -22278,7 +22313,7 @@ static void ggml_compute_forward_rope_f16(
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
-                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, cache_ne, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
             else {
                 const int64_t p_t = pos[i2];
@@ -22287,7 +22322,7 @@ static void ggml_compute_forward_rope_f16(
                 const int64_t p_e = pos[i2 + ne2 * 3];
                 ggml_mrope_cache_init(
                     p_t, p_h, p_w, p_e, sections, is_imrope, is_vision,
-                    freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                    freq_scale, freq_factors, corr_dims, cache_ne, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
 
             for (int64_t i1 = 0; i1 < ne1; i1++) {
