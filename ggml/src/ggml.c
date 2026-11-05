@@ -14258,24 +14258,30 @@ static void ggml_compute_forward_multi_add_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int nr  = ggml_nrows(dst);
+    const int64_t nr  = ggml_nrows(dst);
+    const int64_t ne0 = dst->ne[0];
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // with fewer rows than threads (e.g. one token) also split the rows into column blocks of
+    // at least 64 floats; each thread gets a contiguous range of (row, column block)
+    int64_t nblk = nr < nth ? MIN((nth + nr - 1)/nr, (ne0 + 63)/64) : 1;
+    const int64_t blk = nblk > 1 ? (((ne0 + nblk - 1)/nblk + 15) & ~(int64_t)15) : ne0;
+    nblk = (ne0 + blk - 1)/blk;
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const int64_t nw  = nr*nblk;
+    const int64_t dw  = (nw + nth - 1)/nth;
+    const int64_t iw0 = dw*ith;
+    const int64_t iw1 = MIN(iw0 + dw, nw);
 
-    int64_t ne0 = dst->ne[0];
+    for (int64_t iw = iw0; iw < iw1; ++iw) {
+        const int64_t i1  = iw/nblk;
+        const int64_t off = (iw - i1*nblk)*blk;
+        const int     n   = MIN(blk, ne0 - off);
 
-    for (int i1 = ir0; i1 < ir1; ++i1) {
-
-        float * dst_ptr  = (float *) ((char *) dst->data + i1*dst->nb[1] );
-        const float * data = (const float *) ((const char *)src->data + i1*src->nb[1]);
-        memset(dst_ptr, 0, ne0*sizeof(float));
+        float * dst_ptr  = (float *) ((char *) dst->data + i1*dst->nb[1]) + off;
+        const float * data = (const float *) ((const char *)src->data + i1*src->nb[1]) + off;
+        memset(dst_ptr, 0, n*sizeof(float));
         for (int j = 0; j < n_add; ++j) {
-            ggml_vec_add_f32(ne0, dst_ptr, dst_ptr, data + j*ne0);
+            ggml_vec_add_f32(n, dst_ptr, dst_ptr, data + j*ne0);
         }
     }
 }
@@ -16846,18 +16852,17 @@ static void ggml_compute_forward_relu_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     GGML_ASSERT(ggml_is_contiguous_1(src0));
     GGML_ASSERT(ggml_is_contiguous_1(dst));
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
+    const int ith = params->ith;
+    const int nth = params->nth;
+
     const int n  = ggml_nrows(src0);
     const int nc = src0->ne[0];
 
-    for (int i = 0; i < n; i++) {
+    for (int i = ith; i < n; i += nth) {
         ggml_vec_relu_f32(nc,
                 (float *) ((char *) dst->data  + i*( dst->nb[1])),
                 (float *) ((char *) src0->data + i*(src0->nb[1])));
@@ -18106,33 +18111,34 @@ static void ggml_compute_forward_norm_f32(
     GGML_ASSERT(eps > 0.0f);
 
     // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    const int64_t nr = ne01*ne02*ne03;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)x[i00];
-                }
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                float mean = sum/ne00;
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                ggml_float sum2 = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    float v = x[i00] - mean;
-                    y[i00] = v;
-                    sum2 += (ggml_float)(v*v);
-                }
-
-                float variance = sum2/ne00;
-                const float scale = 1.0f/sqrtf(variance + eps);
-
-                ggml_vec_scale_f32(ne00, y, scale);
-            }
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)x[i00];
         }
+
+        float mean = sum/ne00;
+
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+        ggml_float sum2 = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            float v = x[i00] - mean;
+            y[i00] = v;
+            sum2 += (ggml_float)(v*v);
+        }
+
+        float variance = sum2/ne00;
+        const float scale = 1.0f/sqrtf(variance + eps);
+
+        ggml_vec_scale_f32(ne00, y, scale);
     }
 }
 
@@ -18186,35 +18192,35 @@ static void ggml_compute_forward_fused_norm_f32(
     const float * c = (const float *)src1->data;
 
     // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    const int64_t nr = ne01*ne02*ne03;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    ggml_float xi = (ggml_float)x[i00];
-                    sum += xi;
-                }
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                const float mean = sum/ne00;
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                ggml_float sum2 = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    float v = x[i00] - mean;
-                    y[i00] = v * c[i00];
-                    sum2 += (ggml_float)(v*v);
-                }
-
-                float variance = sum2/ne00;
-                const float scale = 1.0f/sqrtf(variance + eps);
-
-                ggml_vec_scale_f32(ne00, y, scale);
-
-            }
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            ggml_float xi = (ggml_float)x[i00];
+            sum += xi;
         }
+
+        const float mean = sum/ne00;
+
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+        ggml_float sum2 = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            float v = x[i00] - mean;
+            y[i00] = v * c[i00];
+            sum2 += (ggml_float)(v*v);
+        }
+
+        float variance = sum2/ne00;
+        const float scale = 1.0f/sqrtf(variance + eps);
+
+        ggml_vec_scale_f32(ne00, y, scale);
     }
 }
 
@@ -29720,13 +29726,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_ELU:
-                case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_HARDSWISH:
                 case GGML_UNARY_OP_HARDSIGMOID:
                     {
                         n_tasks = 1;
                     } break;
 
+                case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_GELU:
