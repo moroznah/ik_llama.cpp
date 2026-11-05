@@ -613,6 +613,12 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 
 static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 
+#if defined(_MSC_VER)
+#define GGML_CACHE_ALIGN __declspec(align(CACHE_LINE_SIZE))
+#else
+#define GGML_CACHE_ALIGN __attribute__((aligned(CACHE_LINE_SIZE)))
+#endif
+
 static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float * restrict x, size_t bx, const float * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t * restrict x, size_t bx, ggml_bf16_t * restrict y, size_t by, int nrc);
@@ -3168,6 +3174,15 @@ struct ggml_context_container {
     struct ggml_context context;
 };
 
+// two-level barrier: threads arrive in groups of GGML_BARRIER_GROUP, each group on its own cache line
+#define GGML_BARRIER_GROUP      8
+#define GGML_BARRIER_MAX_GROUPS 64
+
+struct ggml_barrier_line {
+    atomic_int v;
+    char pad[CACHE_LINE_SIZE - sizeof(atomic_int)];
+};
+
 struct ggml_compute_state_shared {
     const struct ggml_cgraph * cgraph;
     const struct ggml_cplan * cplan;
@@ -3176,15 +3191,22 @@ struct ggml_compute_state_shared {
     int n_batch;
 
     // synchronization primitives
-    atomic_int n_barrier;
-    atomic_int n_barrier_passed;
+    // each counter has its own cache line: a write to one must not invalidate the line that
+    // the other threads read in the barrier (n_threads, n_batch, ec)
+    GGML_CACHE_ALIGN atomic_int n_barrier;
+    GGML_CACHE_ALIGN atomic_int n_barrier_passed;
 
     ggml_abort_callback abort_callback; // abort ggml_graph_compute when true
     void * abort_callback_data;
 
-    atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
+    GGML_CACHE_ALIGN atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
 
-    enum ggml_status ec;
+    GGML_CACHE_ALIGN enum ggml_status ec;
+
+    // per-group arrival and release counters of the two-level barrier, in two separate arrays so
+    // that the two lines of a group are not adjacent (adjacent-line prefetch)
+    GGML_CACHE_ALIGN struct ggml_barrier_line barrier_arrive[GGML_BARRIER_MAX_GROUPS];
+    GGML_CACHE_ALIGN struct ggml_barrier_line barrier_release[GGML_BARRIER_MAX_GROUPS];
 };
 
 struct ggml_compute_state {
@@ -5032,6 +5054,23 @@ inline static void ggml_critical_section_start(void) {
     }
 }
 
+static inline void ggml_barrier_wait(atomic_int * passed, int passed_old) {
+    const int n_spin_before_sleep = 100000;
+    while (true) {
+        for (int i = 0; i < n_spin_before_sleep; i++) {
+            if (atomic_load(passed) != passed_old) {
+                return;
+            }
+        #if defined(__SSE3__)
+            _mm_pause();
+        #elif defined __ARM_NEON
+            __asm__ __volatile__("isb\n");
+        #endif
+        }
+        sched_yield();
+    }
+}
+
 static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
@@ -5049,26 +5088,50 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
         atomic_fetch_add(n_barrier_passed, 1);
     } else {
         // wait for other threads
-        const int n_spin_before_sleep = 100000;
-        while (true) {
-            for (int i = 0; i < n_spin_before_sleep; i++) {
-                if (atomic_load(n_barrier_passed) != passed_old) {
-                    return;
-                }
-            #if defined(__SSE3__)
-                _mm_pause();
-            #elif defined __ARM_NEON
-                __asm__ __volatile__("isb\n");
-            #endif
-            }
-            sched_yield();
-        }
+        ggml_barrier_wait(n_barrier_passed, passed_old);
     }
 }
 
 #ifdef GGML_USE_OPENMP
+// With many threads a single counter that every thread updates is slow. Threads first meet in
+// groups of GGML_BARRIER_GROUP; the last arrival of each group goes on to a barrier of the group
+// leaders, and the last of those releases all groups.
+static void ggml_barrier_2level(struct ggml_compute_state_shared * shared, int ith, int n_group) {
+    const int n_threads = shared->n_threads;
+    const int ig   = ith / GGML_BARRIER_GROUP;
+    const int n_ig = ig == n_group - 1 ? n_threads - ig*GGML_BARRIER_GROUP : GGML_BARRIER_GROUP;
+
+    atomic_int * arrive  = &shared->barrier_arrive[ig].v;
+    atomic_int * release = &shared->barrier_release[ig].v;
+
+    // all release counters have the same value: the last arrival sets all of them to old + 1
+    const int old = atomic_load(release);
+
+    if (n_ig > 1) {
+        if (atomic_fetch_add(arrive, 1) != n_ig - 1) {
+            ggml_barrier_wait(release, old);
+            return;
+        }
+        atomic_store(arrive, 0);
+    }
+
+    if (atomic_fetch_add(&shared->n_barrier, 1) == n_group - 1) {
+        atomic_store(&shared->n_barrier, 0);
+        for (int g = 0; g < n_group; ++g) {
+            atomic_store(&shared->barrier_release[g].v, old + 1);
+        }
+    } else {
+        ggml_barrier_wait(release, old);
+    }
+}
+
 static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
+        return;
+    }
+    const int n_group = (shared->n_threads + GGML_BARRIER_GROUP - 1)/GGML_BARRIER_GROUP;
+    if (n_group > 1 && n_group <= GGML_BARRIER_MAX_GROUPS) {
+        ggml_barrier_2level(shared, omp_get_thread_num(), n_group);
         return;
     }
     if (shared && shared->n_batch > 32) {
@@ -30271,6 +30334,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.abort_callback_data     =*/ NULL,
         /*.current_chunk           =*/ 0,
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
+        /*.barrier_arrive          =*/ {{0}},
+        /*.barrier_release         =*/ {{0}},
     };
 
 #ifdef GGML_USE_OPENMP
