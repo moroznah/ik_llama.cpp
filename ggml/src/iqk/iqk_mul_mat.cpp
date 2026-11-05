@@ -1705,8 +1705,10 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int gqa_ratio, int repeat_type, 
         const int out_token_stride    = head_dim * n_heads;
 
         float * state = state_out + state_head_offset;
-        for (int i = 0; i < head_dim * head_dim; ++i) {
-            state[i] = state_in[state_head_offset + i];
+        if (state_out != state_in) {
+            for (int i = 0; i < head_dim * head_dim; ++i) {
+                state[i] = state_in[state_head_offset + i];
+            }
         }
 
         for (int t = 0; t < n_tokens; ++t) {
@@ -1825,8 +1827,10 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
         const int out_token_stride = head_dim * n_heads;
 
         float * state = state_out + state_head_offset;
-        for (int i = 0; i < head_dim * head_dim; ++i) {
-            state[i] = state_in[state_head_offset + i];
+        if (state_out != state_in) {
+            for (int i = 0; i < head_dim * head_dim; ++i) {
+                state[i] = state_in[state_head_offset + i];
+            }
         }
 
         for (int t = 0; t < n_tokens; ++t) {
