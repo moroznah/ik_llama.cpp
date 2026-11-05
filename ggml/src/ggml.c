@@ -13655,6 +13655,24 @@ static void ggml_compute_forward_add_f32(
     GGML_ASSERT( nb0 == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
 
+    if (ggml_are_same_shape(src0, src1) && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        // no broadcast: split all elements into contiguous pieces of at least 1024 floats, so that
+        // tensors with fewer rows than threads (e.g. one token) or with rows of a single element
+        // use all threads
+        const int64_t n  = ggml_nelements(dst);
+        const int64_t dn = MAX(1024, ((n + nth - 1)/nth + 15) & ~(int64_t)15);
+        const int64_t i0 = MIN(n, dn*ith);
+        const int64_t i1 = MIN(n, i0 + dn);
+        if (i0 < i1) {
+#ifdef GGML_USE_ACCELERATE
+            vDSP_vadd((const float *) src0->data + i0, 1, (const float *) src1->data + i0, 1, (float *) dst->data + i0, 1, i1 - i0);
+#else
+            ggml_vec_add_f32(i1 - i0, (float *) dst->data + i0, (const float *) src0->data + i0, (const float *) src1->data + i0);
+#endif
+        }
+        return;
+    }
+
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
 
@@ -15085,6 +15103,22 @@ static void ggml_compute_forward_mul_f32(
             memcpy(res, src, (end - start)*sizeof(float));
         }
         ggml_vec_scale_f32(end - start, res, *(const float *)dst->src[1]->data);
+        return;
+    }
+
+    if (ggml_are_same_shape(src0, src1) && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        // no broadcast: split all elements into contiguous pieces of at least 1024 floats (see add_f32)
+        const int64_t n  = ggml_nelements(dst);
+        const int64_t dn = MAX(1024, ((n + nth - 1)/nth + 15) & ~(int64_t)15);
+        const int64_t i0 = MIN(n, dn*ith);
+        const int64_t i1 = MIN(n, i0 + dn);
+        if (i0 < i1) {
+#ifdef GGML_USE_ACCELERATE
+            vDSP_vmul((const float *) src0->data + i0, 1, (const float *) src1->data + i0, 1, (float *) dst->data + i0, 1, i1 - i0);
+#else
+            ggml_vec_mul_f32(i1 - i0, (float *) dst->data + i0, (const float *) src0->data + i0, (const float *) src1->data + i0);
+#endif
+        }
         return;
     }
 
